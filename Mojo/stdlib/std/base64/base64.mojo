@@ -20,6 +20,10 @@ from std.base64 import b64encode
 """
 
 
+from std.memory import unsafe_memcpy
+from std.sys import simd_byte_width
+
+from ._b64decode import _count_base64_chars, _decode_base64_block
 from ._b64encode import _b64encode
 
 # ===-----------------------------------------------------------------------===#
@@ -193,10 +197,7 @@ def b64decode(str: StringSlice[_]) raises -> List[Byte]:
 
     var input = str.as_bytes()
 
-    var n = 0
-    for char in input:
-        if not _is_ascii_whitespace(char):
-            n += 1
+    var n = _count_base64_chars(input)
 
     if n % 4 != 0:
         raise Error(
@@ -204,32 +205,60 @@ def b64decode(str: StringSlice[_]) raises -> List[Byte]:
             t" divisible by 4"
         )
 
-    var result = List[Byte](capacity=(n // 4) * 3)
+    var result = List[Byte](unsafe_uninit_length=(n // 4) * 3)
 
     # This algorithm is based on https://arxiv.org/abs/1704.00605. It reads
     # directly from `input`, skipping over whitespace as it goes, so it never
     # allocates or copies a whitespace-free version of the input.
+    comptime width = simd_byte_width()
     var pos = 0
-    for _ in range(0, n, 4):
+    var remaining = n
+    var output_pos = 0
+    while remaining > 0:
+        # Avoid repeatedly probing whitespace-heavy input with the SIMD path.
+        if len(input) - pos >= width and not _is_ascii_whitespace(input[pos]):
+            var chars = (
+                input.unsafe_ptr().unsafe_offset(pos).unsafe_load[width=width]()
+            )
+            var decoded, valid = _decode_base64_block(chars)
+            if valid:
+                # Store only the packed prefix, never past the output buffer.
+                unsafe_memcpy(
+                    dest=result.unsafe_ptr().unsafe_offset(output_pos),
+                    src=Pointer(to=decoded).unsafe_bitcast[Byte](),
+                    count=3 * width // 4,
+                )
+                pos += width
+                remaining -= width
+                output_pos += 3 * width // 4
+                continue
+
+        # Consume one significant quartet before retrying SIMD. This preserves
+        # whitespace handling, padding termination, and scalar error ordering.
         var a_byte, a_pos = _next_significant_byte(input, pos)
         var b_byte, b_pos = _next_significant_byte(input, a_pos)
         var c_byte, c_pos = _next_significant_byte(input, b_pos)
         var d_byte, d_pos = _next_significant_byte(input, c_pos)
         pos = d_pos
+        remaining -= 4
 
         var a = _ascii_to_value(a_byte)
         var b = _ascii_to_value(b_byte)
         var c = _ascii_to_value(c_byte)
         var d = _ascii_to_value(d_byte)
 
-        result.append((a << 2) | (b >> 4))
+        result[output_pos] = (a << 2) | (b >> 4)
+        output_pos += 1
         if c_byte == `=`:
             break
-        result.append(((b & 0x0F) << 4) | (c >> 2))
+        result[output_pos] = ((b & 0x0F) << 4) | (c >> 2)
+        output_pos += 1
         if d_byte == `=`:
             break
-        result.append(((c & 0x03) << 6) | d)
+        result[output_pos] = ((c & 0x03) << 6) | d
+        output_pos += 1
 
+    result.shrink(output_pos)
     return result^
 
 
